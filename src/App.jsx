@@ -9,101 +9,72 @@ import {
   Filter, BarChart2, FolderHeart, Music, CornerDownRight, Edit2, Shield,
   Database, Download, UploadCloud
 } from 'lucide-react';
-import { openDB } from 'idb';
-import { clsx } from 'clsx';
-import { twMerge } from 'tailwind-merge';
-import { useDropzone } from 'react-dropzone';
-import { formatDistanceToNow, format } from 'date-fns';
-import { v4 as uuidv4 } from 'uuid';
-import { motion, AnimatePresence } from 'framer-motion';
-import { useInView } from 'react-intersection-observer';
+import { auth, db, storage } from './firebase';
+import {
+  signInAnonymously, onAuthStateChanged, updateProfile
+} from 'firebase/auth';
+import {
+  collection, addDoc, getDocs, doc, updateDoc,
+  deleteDoc, query, orderBy, where, onSnapshot,
+  serverTimestamp, setDoc, getDoc, increment
+} from 'firebase/firestore';
+import {
+  ref, uploadBytes, getDownloadURL
+} from 'firebase/storage';
 
-// --- Utility Functions ---
-function cn(...inputs) {
-  return twMerge(clsx(inputs));
-}
 
-function formatDuration(seconds) {
-  if (!seconds) return '0:00';
-  const m = Math.floor(seconds / 60);
-  const s = Math.floor(seconds % 60);
-  return `${m}:${s < 10 ? '0' : ''}${s}`;
-}
-
-// --- Database Layer ---
-const DB_NAME = 'AnonShareDB';
-const DB_VERSION = 2; // Bumped version
-
-async function initDB() {
-  return openDB(DB_NAME, DB_VERSION, {
-    upgrade(db, oldVersion, newVersion, transaction) {
-      if (!db.objectStoreNames.contains('files')) {
-        const store = db.createObjectStore('files', { keyPath: 'id' });
-        store.createIndex('type', 'type');
-        store.createIndex('date', 'date');
-        store.createIndex('likes', 'likes'); // for sorting
-      } else if (oldVersion < 2) {
-        // Migration for v2: ensure indexes exist if simple v1 was used
-        const store = transaction.objectStore('files');
-        if (!store.indexNames.contains('likes')) store.createIndex('likes', 'likes');
-      }
-
-      if (!db.objectStoreNames.contains('users')) {
-        db.createObjectStore('users', { keyPath: 'id' });
-      }
-      if (!db.objectStoreNames.contains('comments')) {
-        const store = db.createObjectStore('comments', { keyPath: 'id' });
-        store.createIndex('fileId', 'fileId');
-      }
-      if (!db.objectStoreNames.contains('interactions')) { // likes, bookmarks, views
-        const store = db.createObjectStore('interactions', { keyPath: 'id' });
-        store.createIndex('userId_fileId', ['userId', 'fileId']);
-      }
-      if (!db.objectStoreNames.contains('playlists')) {
-        db.createObjectStore('playlists', { keyPath: 'id' });
-      }
-    },
-  });
-}
-
+// --- Hooks ---
 // --- Hooks ---
 function useAuth() {
   const [user, setUser] = useState(null);
 
-  const loadUser = async () => {
-    let storedUser = localStorage.getItem('anon_user');
-    if (storedUser) {
-      setUser(JSON.parse(storedUser));
-    } else {
-      const newUser = {
-        id: uuidv4(),
-        displayName: `User_${Math.floor(Math.random() * 10000)}`,
-        avatarColor: `hsl(${Math.random() * 360}, 70%, 50%)`,
-        createdAt: new Date().toISOString()
-      };
-      localStorage.setItem('anon_user', JSON.stringify(newUser));
-      setUser(newUser);
-      const db = await initDB();
-      await db.put('users', newUser);
-    }
-  };
-
   useEffect(() => {
-    loadUser();
+    // Listen for auth state
+    const unsubscribe = onAuthStateChanged(auth, async (u) => {
+      if (u) {
+        // User exists, check if profile doc exists
+        const userRef = doc(db, 'users', u.uid);
+        const userSnap = await getDoc(userRef);
+
+        let userData = {
+          id: u.uid,
+          displayName: u.displayName || `User_${u.uid.slice(0, 5)}`,
+          avatarColor: u.photoURL || `hsl(${Math.random() * 360}, 70%, 50%)`,
+          createdAt: u.metadata.creationTime
+        };
+
+        if (userSnap.exists()) {
+          userData = { ...userData, ...userSnap.data() };
+        } else {
+          await setDoc(userRef, userData);
+        }
+        setUser(userData);
+      } else {
+        // No user, sign in anonymously
+        signInAnonymously(auth).catch((error) => {
+          console.error("Auth Error:", error);
+        });
+      }
+    });
+    return () => unsubscribe();
   }, []);
 
   const updateUser = async (updates) => {
     if (!user) return;
     const updated = { ...user, ...updates };
-    localStorage.setItem('anon_user', JSON.stringify(updated));
-    setUser(updated);
+    setUser(updated); // Optimistic
 
-    const db = await initDB();
-    await db.put('users', updated);
+    // Update Auth Profile
+    if (auth.currentUser) {
+      await updateProfile(auth.currentUser, {
+        displayName: updates.displayName,
+        photoURL: updates.avatarColor
+      });
+    }
 
-    // Optional: Update past files (expensive but consistent)
-    // For this demo, we'll just update the user store.
-    // In a real app, you'd index by authorId.
+    // Update Firestore Doc
+    const userRef = doc(db, 'users', user.id);
+    await updateDoc(userRef, updates);
   };
 
   return { user, updateUser };
@@ -394,64 +365,30 @@ function App() {
     localStorage.setItem('theme', darkMode ? 'dark' : 'light');
   }, [darkMode]);
 
+  // --- Real-time Data Listeners ---
   useEffect(() => {
-    fetchLibrary();
+    // Listen to Files
+    const q = query(collection(db, 'files'), orderBy('date', 'desc'));
+    const unsub = onSnapshot(q, (snapshot) => {
+      const filesData = snapshot.docs.map(d => ({
+        id: d.id,
+        ...d.data(),
+        metrics: d.data().metrics || { likes: 0, views: 0, comments: 0 }
+      }));
+      setFiles(filesData);
+      setLoading(false);
+    });
+    return () => unsub();
   }, []);
 
   useEffect(() => {
-    if (!user) return;
-    // Load user interactions
-    initDB().then(async db => {
-      const acts = await db.getAllFromIndex('interactions', 'userId_fileId', IDBKeyRange.bound([user.id, ''], [user.id, '\uffff']));
-      const map = {};
-      acts.forEach(a => map[a.fileId] = { ...map[a.fileId], [a.type]: true });
-      setActiveInteractions(map);
+    // Listen to Users
+    const unsub = onSnapshot(collection(db, 'users'), (snapshot) => {
+      setAllUsers(snapshot.docs.map(d => d.data()));
     });
-  }, [user]);
+    return () => unsub();
+  }, []);
 
-  // Filtering Logic
-  useEffect(() => {
-    let res = [...files];
-    let usersRes = [...allUsers];
-
-    // Search
-    if (search) {
-      const lower = search.toLowerCase();
-      res = res.filter(f => f.title.toLowerCase().includes(lower) || f.tags?.some(t => t.toLowerCase().includes(lower)));
-      // Filter users too if searching
-      if (category === 'People') {
-        // If category is people, we use a different list, handled in render usually, but let's filter here
-      }
-    }
-
-    // Category
-    if (category !== 'All') {
-      if (category === 'Videos') res = res.filter(f => f.type.includes('video'));
-      else if (category === 'Photos') res = res.filter(f => f.type === 'image');
-      else if (category === 'Text') res = res.filter(f => f.type === 'text');
-      else if (category === 'Favorites') res = res.filter(f => activeInteractions[f.id]?.bookmark);
-      // 'People' category handled in Render
-    }
-
-    // Sort
-    if (sortBy === 'newest') res.sort((a, b) => new Date(b.date) - new Date(a.date));
-    else if (sortBy === 'oldest') res.sort((a, b) => new Date(a.date) - new Date(b.date));
-    else if (sortBy === 'popular') res.sort((a, b) => (b.metrics?.likes || 0) - (a.metrics?.likes || 0));
-
-    setFilteredFiles(res);
-  }, [files, search, category, sortBy, activeInteractions]);
-
-
-  async function fetchLibrary() {
-    setLoading(true);
-    const db = await initDB();
-    const all = await db.getAll('files');
-    const users = await db.getAll('users');
-    const withMetrics = all.map(f => ({ ...f, metrics: f.metrics || { likes: 0, views: 0, comments: 0 } }));
-    setFiles(withMetrics);
-    setAllUsers(users);
-    setLoading(false);
-  }
 
   // --- Actions ---
 
@@ -463,65 +400,76 @@ function App() {
 
   const handleInteraction = async (fileId, type) => {
     if (!user) return;
-    const db = await initDB();
     const existing = activeInteractions[fileId]?.[type];
 
-    // Update Local State
+    // Optimistic Update
     setActiveInteractions(prev => ({
       ...prev,
       [fileId]: { ...prev[fileId], [type]: !existing }
     }));
 
-    // Update DB
+    // Firestore Update
     if (existing) {
-      // Remove interaction
-      // (Requires ID logic, simplified here by ignoring exact ID removal for demo, just re-adding/overwriting)
-      // In real app, query exact interaction ID to delete.
+      // Find and delete the interaction doc?
+      // Query to find ID
+      const q = query(collection(db, 'interactions'), where('userId', '==', user.id), where('fileId', '==', fileId), where('type', '==', type));
+      const snap = await getDocs(q);
+      snap.forEach(d => deleteDoc(d.ref));
     } else {
-      await db.add('interactions', {
-        id: uuidv4(),
+      await addDoc(collection(db, 'interactions'), {
         userId: user.id,
         fileId,
         type,
-        timestamp: new Date().toISOString()
+        timestamp: serverTimestamp()
       });
     }
 
-    // Optimize: Update aggregate count on file object immediately
+    // Update File Metrics (Atomic Increment)
     if (type === 'like') {
-      const fIndex = files.findIndex(f => f.id === fileId);
-      if (fIndex > -1) {
-        const newFiles = [...files];
-        newFiles[fIndex].metrics.likes += (existing ? -1 : 1);
-        setFiles(newFiles);
-        // Async update DB
-        const f = newFiles[fIndex];
-        db.put('files', f);
-      }
+      const fileRef = doc(db, 'files', fileId);
+      await updateDoc(fileRef, {
+        "metrics.likes": increment(existing ? -1 : 1)
+      });
     }
   };
 
   const handleUpload = async (newFiles) => {
-    const db = await initDB();
-    const processed = newFiles.map(f => ({
-      ...f,
-      id: uuidv4(),
-      metrics: { likes: 0, views: 0, comments: 0 },
-      authorId: user?.id,
-      authorName: user?.displayName
-    }));
+    for (const f of newFiles) {
+      let mediaUrl = null;
+      let thumbnailUrl = null;
 
-    for (const f of processed) await db.add('files', f);
+      // Upload Binary
+      if (f.blob) {
+        const storageRef = ref(storage, `uploads/${user.id}/${Date.now()}_${f.id}`);
+        await uploadBytes(storageRef, f.blob);
+        mediaUrl = await getDownloadURL(storageRef);
+      }
+      if (f.thumbnail) {
+        // If thumbnail is a blob, upload it too. If dataURL, maybe keep it (limit size)
+        // For now assuming thumbnail is dataURL, better to upload if large.
+        // Skipping optimization for brevity.
+        thumbnailUrl = f.thumbnail;
+      }
 
-    fetchLibrary();
+      // Add to Firestore
+      await addDoc(collection(db, 'files'), {
+        ...f,
+        blob: null, // Don't store blob in firestore
+        mediaUrl,
+        thumbnail: thumbnailUrl,
+        metrics: { likes: 0, views: 0, comments: 0 },
+        authorId: user?.id,
+        authorName: user?.displayName,
+        date: new Date().toISOString()
+      });
+    }
     setView('home');
   };
 
   const handleComment = async (fileId, content, parentId = null) => {
     if (!user || !content.trim()) return;
-    const db = await initDB();
-    const newComment = {
-      id: uuidv4(),
+
+    await addDoc(collection(db, 'comments'), {
       fileId,
       parentId,
       content,
@@ -530,25 +478,15 @@ function App() {
       authorAvatar: user.avatarColor,
       timestamp: new Date().toISOString(),
       likes: 0
-    };
-    await db.add('comments', newComment);
-    setComments(prev => [newComment, ...prev]);
+    });
 
-    // Update file comment count
-    const fIndex = files.findIndex(f => f.id === fileId);
-    if (fIndex > -1) {
-      const updated = [...files];
-      updated[fIndex].metrics.comments += 1;
-      setFiles(updated);
-      db.put('files', updated[fIndex]);
-    }
+    const fileRef = doc(db, 'files', fileId);
+    await updateDoc(fileRef, {
+      "metrics.comments": increment(1)
+    });
   };
 
   // --- Views ---
-
-  if (view === 'storage') {
-    return <StorageView onClose={() => setView('home')} />;
-  }
 
   if (view === 'upload') {
     return (
@@ -604,8 +542,6 @@ function App() {
           <SidebarItem icon={<Video />} label="Videos" active={category === 'Videos'} onClick={() => { setCategory('Videos'); setView('home'); }} expanded={isSidebarOpen} />
           <SidebarItem icon={<ImageIcon />} label="Photos" active={category === 'Photos'} onClick={() => { setCategory('Photos'); setView('home'); }} expanded={isSidebarOpen} />
           <SidebarItem icon={<FileText />} label="Articles" active={category === 'Text'} onClick={() => { setCategory('Text'); setView('home'); }} expanded={isSidebarOpen} />
-          <div className="my-4 border-t border-border/50 mx-4" />
-          <SidebarItem icon={<Database />} label="Data & Storage" active={view === 'storage'} onClick={() => setView('storage')} expanded={isSidebarOpen} />
         </div>
 
         <div className="p-4 border-t border-border/50">
@@ -838,13 +774,13 @@ const FileDetailView = ({ file, onClose, interactions, onInteract, onComment, al
           <div className="rounded-2xl overflow-hidden bg-black shadow-2xl ring-1 ring-border">
             {file.type.includes('video') ? (
               <VideoPlayer
-                src={URL.createObjectURL(file.blob)}
+                src={file.mediaUrl || (file.blob ? URL.createObjectURL(file.blob) : '')}
                 poster={file.thumbnail}
                 duration={file.duration}
                 autoPlay
               />
             ) : file.type === 'image' ? (
-              <img src={URL.createObjectURL(file.blob)} className="w-full h-auto max-h-[80vh] object-contain mx-auto" />
+              <img src={file.mediaUrl || (file.blob ? URL.createObjectURL(file.blob) : '')} className="w-full h-auto max-h-[80vh] object-contain mx-auto" />
             ) : (
               <div className="p-8 md:p-12 bg-card min-h-[50vh] prose dark:prose-invert max-w-none">
                 <h1 className="text-4xl font-extrabold mb-8">{file.title}</h1>
@@ -1108,118 +1044,6 @@ const generateVideoThumbnail = (file) => new Promise((resolve) => {
 
 
 
-const StorageView = ({ onClose }) => {
-  const [stats, setStats] = useState({ files: 0, size: 0, comments: 0, interactions: 0 });
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    calculateStats();
-  }, []);
-
-  const calculateStats = async () => {
-    setLoading(true);
-    const db = await initDB();
-    const files = await db.getAll('files');
-    const comments = await db.count('comments');
-    const interactions = await db.count('interactions');
-
-    let totalSize = 0;
-    files.forEach(f => {
-      if (f.blob) totalSize += f.blob.size;
-    });
-
-    setStats({
-      files: files.length,
-      size: totalSize,
-      comments,
-      interactions
-    });
-    setLoading(false);
-  };
-
-  const formatBytes = (bytes, decimals = 2) => {
-    if (!+bytes) return '0 Bytes';
-    const k = 1024;
-    const dm = decimals < 0 ? 0 : decimals;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
-  };
-
-  const handleExport = async () => {
-    const db = await initDB();
-    const exportData = {
-      version: DB_VERSION,
-      date: new Date().toISOString(),
-      files: await db.getAll('files'),
-      comments: await db.getAll('comments'),
-      interactions: await db.getAll('interactions'),
-      users: await db.getAll('users')
-    };
-
-    const metadataOnly = {
-      ...exportData,
-      files: exportData.files.map(f => ({ ...f, blob: null, thumbnail: null }))
-    };
-
-    const blob = new Blob([JSON.stringify(metadataOnly, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `anonstream-backup-${new Date().toISOString().slice(0, 10)}.json`;
-    a.click();
-  };
-
-  const handleClear = async () => {
-    if (confirm("DANGER: This will delete ALL your uploaded files, comments, and interactions permanently. This cannot be undone.")) {
-      const db = await initDB();
-      await db.clear('files');
-      await db.clear('comments');
-      await db.clear('interactions');
-      await db.clear('playlists');
-      calculateStats();
-      alert("Database cleared.");
-    }
-  };
-
-  return (
-    <div className="max-w-4xl mx-auto p-6 md:p-12 space-y-8">
-      <div className="flex items-center gap-4 mb-6">
-        <Button variant="ghost" size="icon" onClick={onClose}><ArrowLeft /></Button>
-        <div>
-          <h2 className="text-3xl font-bold">Storage & Data</h2>
-          <p className="text-muted-foreground">Manage your locally stored content</p>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-        <CardStat icon={<FileText className="text-blue-500" />} label="Total Files" value={stats.files} />
-        <CardStat icon={<Database className="text-purple-500" />} label="Storage Used" value={formatBytes(stats.size)} />
-        <CardStat icon={<MessageSquare className="text-green-500" />} label="Comments" value={stats.comments} />
-        <CardStat icon={<Heart className="text-red-500" />} label="Interactions" value={stats.interactions} />
-      </div>
-
-      <div className="bg-card border border-border rounded-xl p-6 space-y-6">
-        <div>
-          <h3 className="text-xl font-semibold mb-2 flex items-center gap-2"><Download size={20} /> Export Metadata</h3>
-          <p className="text-muted-foreground text-sm mb-4">Download a JSON file containing all your post titles, descriptions, comments, and history. (Note: Actual video/image files are skipped in this JSON backup to save space).</p>
-          <Button onClick={handleExport} variant="outline" className="gap-2">Download JSON Backup</Button>
-        </div>
-
-        <div className="border-t border-border pt-6">
-          <h3 className="text-xl font-semibold mb-2 text-destructive flex items-center gap-2"><Trash2 size={20} /> Danger Zone</h3>
-          <p className="text-muted-foreground text-sm mb-4">Clear all local data. This app uses <strong>IndexedDB</strong>, so your files exist only in this browser.</p>
-          <Button onClick={handleClear} variant="destructive" className="gap-2">Clear All Data</Button>
-        </div>
-      </div>
-
-      <div className="bg-secondary/20 p-4 rounded-lg text-xs text-muted-foreground">
-        <p><strong>Technical Info:</strong> All your files (Videos, Images) are stored as binary Blobs directly in your browser's IndexedDB system. They are never uploaded to a remote server. If you clear your browser cookies/data, this content will be lost.</p>
-      </div>
-    </div>
-  );
-};
-
 const CardStat = ({ icon, label, value }) => (
   <div className="bg-card border border-border p-6 rounded-xl flex items-center gap-4 shadow-sm">
     <div className="p-3 bg-secondary rounded-full">{icon}</div>
@@ -1237,21 +1061,23 @@ const UserProfileView = ({ userId, onClose, onFileClick, currentUser, goToProfil
 
   useEffect(() => {
     const load = async () => {
-      const db = await initDB();
       let u = null;
       if (currentUser && currentUser.id === userId) {
         u = currentUser;
       } else {
-        u = await db.get('users', userId);
+        const docRef = doc(db, 'users', userId);
+        const sn = await getDoc(docRef);
+        if (sn.exists()) u = sn.data();
       }
 
-      // Fallback for mock users or if not found
+      // Fallback
       if (!u) u = { id: userId, displayName: 'Unknown User', avatarColor: '#999', createdAt: new Date().toISOString() };
-
       setProfile(u);
 
-      const allFiles = await db.getAll('files');
-      setUserFiles(allFiles.filter(f => f.authorId === userId).sort((a, b) => new Date(b.date) - new Date(a.date)));
+      const q = query(collection(db, 'files'), where('authorId', '==', userId));
+      const fileSnap = await getDocs(q);
+      const userFilesData = fileSnap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => new Date(b.date) - new Date(a.date));
+      setUserFiles(userFilesData);
     };
     load();
   }, [userId, currentUser]);
